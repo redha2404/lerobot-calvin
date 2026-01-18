@@ -6,6 +6,16 @@ from pathlib import Path
 import sys
 import time
 
+# Path to the LeRobot *repo root* (the one that contains lerobot/)
+LEROBOT_REPO_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "../../../../lerobot/src")
+)
+
+print("Adding LeRobot repo root to PYTHONPATH:", LEROBOT_REPO_ROOT)
+
+if LEROBOT_REPO_ROOT not in sys.path:
+    sys.path.insert(0, LEROBOT_REPO_ROOT)
+
 # This is for using the locally installed repo clone when using slurm
 from calvin_agent.models.calvin_base_model import CalvinBaseModel
 
@@ -33,6 +43,14 @@ from tqdm.auto import tqdm
 
 from calvin_env.envs.play_table_env import get_env
 
+from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.processor.pipeline import PolicyProcessorPipeline
+from lerobot.configs.types import PolicyFeature, FeatureType
+import json
+from safetensors.torch import load_file
+
+
 logger = logging.getLogger(__name__)
 
 EP_LEN = 360
@@ -53,27 +71,123 @@ def make_env(dataset_path):
     # env = Wrapper(env)
     return env
 
+def normalize_features(features: dict | None):
+    if features is None:
+        return None
+
+    out = {}
+    for name, ft in features.items():
+        if isinstance(ft, PolicyFeature):
+            out[name] = ft
+        elif isinstance(ft, dict):
+            out[name] = PolicyFeature(
+                type=FeatureType(ft["type"]),
+                shape=tuple(ft.get("shape", ())),
+            )
+        else:
+            raise TypeError(f"Unsupported feature type for {name}: {type(ft)}")
+    return out
+
 
 class CustomModel(CalvinBaseModel):
-    def __init__(self):
-        logger.warning("Please implement these methods as an interface to your custom model architecture.")
-        raise NotImplementedError
+    def __init__(self, checkpoint_dir, device="cpu"):
+        checkpoint_dir = Path(checkpoint_dir)
+        model_dir = checkpoint_dir / "pretrained_model"
+
+        self.device = torch.device(device)
+
+        # -------------------------
+        # 1. Load preprocessors
+        # -------------------------
+        self.preprocessor = PolicyProcessorPipeline.from_pretrained(
+            pretrained_model_name_or_path=model_dir,
+            config_filename="policy_preprocessor.json",
+            overrides={"device_processor": {"device": "cpu"}},
+        )
+
+        self.postprocessor = PolicyProcessorPipeline.from_pretrained(
+            pretrained_model_name_or_path=model_dir,
+            config_filename="policy_postprocessor.json",
+            overrides={"device_processor": {"device": "cpu"}},
+        )
+
+        # -------------------------
+        # 2. Load config
+        # -------------------------
+        with open(model_dir / "config.json", "r") as f:
+            cfg_dict = json.load(f)
+
+        cfg_dict = dict(cfg_dict)          # sécurité
+        cfg_dict.pop("type", None)         # ← LIGNE CRUCIALE
+        config = SmolVLAConfig(**cfg_dict)
+        config.input_features = normalize_features(config.input_features)
+        config.output_features = normalize_features(config.output_features)
+
+        # -------------------------
+        # 3. Instantiate policy
+        # -------------------------
+        self.policy = SmolVLAPolicy(config)
+        self.policy.to(self.device)
+
+        # -------------------------
+        # 4. Load weights
+        # -------------------------
+        state_dict = load_file(
+            str(model_dir / "model.safetensors"),
+            device=str(self.device),
+        )
+        self.policy.load_state_dict(state_dict, strict=False)
+
+
+        self.policy.eval()
+        self.reset()
 
     def reset(self):
-        """
-        This is called
-        """
-        raise NotImplementedError
+        self.policy.reset()
 
+    @torch.no_grad()
     def step(self, obs, goal):
-        """
-        Args:
-            obs: environment observations
-            goal: embedded language goal
-        Returns:
-            action: predicted action
-        """
-        raise NotImplementedError
+        batch = {
+            "observation.images.camera1": torch.from_numpy(
+                obs["rgb_obs"]["rgb_static"]
+            ).permute(2, 0, 1),
+
+            "observation.images.camera2": torch.from_numpy(
+                obs["rgb_obs"]["rgb_gripper"]
+            ).permute(2, 0, 1),
+
+            "observation.state": torch.from_numpy(
+                obs["robot_obs"]
+            ).to(dtype=self.policy.model.state_proj.weight.dtype),
+
+            "task": goal,
+        }
+
+        # batch dim + device
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                batch[k] = v.unsqueeze(0).to(self.device)
+            else:
+                # e.g. task string → leave untouched
+                batch[k] = v
+
+        batch = self.preprocessor(batch)
+
+        action = self.policy.select_action(batch)
+
+        action = self.postprocessor({"action": action})["action"]
+
+        action = action.squeeze(0).cpu().numpy()
+
+        ee_pos = action[:3]
+        ee_orn = action[3:6]
+
+        gripper_continuous = action[6]
+        gripper = 1 if gripper_continuous > 0 else -1
+
+        return (ee_pos, ee_orn, gripper)
+
+
 
 
 def evaluate_policy(model, env, epoch, eval_log_dir=None, debug=False, create_plan_tsne=False):
@@ -220,9 +334,20 @@ def main():
 
     # evaluate a custom model
     if args.custom_model:
-        model = CustomModel()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = CustomModel(
+        checkpoint_dir=Path(args.checkpoint),
+        device=device,
+
+    )
         env = make_env(args.dataset_path)
-        evaluate_policy(model, env, debug=args.debug)
+        evaluate_policy(
+        model,
+        env,
+        epoch="custom",
+        eval_log_dir=args.eval_log_dir,
+        debug=args.debug,
+    )
     else:
         assert "train_folder" in args
 
