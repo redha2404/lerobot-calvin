@@ -1,3 +1,62 @@
+Repo
+```bash
+git clone --recurse-submodules https://github.com/redha2404/lerobot-calvin.git
+git clone https://github.com/huggingface/lerobot.git
+```
+Locally : 
+```bash
+conda install ffmpeg -c conda-forge
+conda create -n lerobot-calvin_env python=3.10
+conda activate lerobot-calvin_env
+```
+
+Training
+```bash
+cd lerobot-calvin
+pip install -r requirements_final.txt
+cd ../lerobot
+
+import os
+os.environ["WANDB_API_KEY"] = "KEY"
+import wandb
+wandb.login()
+
+from huggingface_hub import login
+login(token="TOKEN")
+
+info = api.dataset_info("redha24/calvin_task_D_D_pick_push")
+print("Dataset found:", info.id)
+
+from huggingface_hub import HfApi
+hub_api = HfApi()
+hub_api.create_tag("redha24/calvin_task_D_D_pick_push", tag="v3.0", repo_type="dataset")
+
+lerobot-train \
+  --policy.path=lerobot/smolvla_base \
+  --dataset.repo_id=redha24/calvin_task_D_D_pick_push \
+  --rename_map='{"observation.images.front":"observation.images.camera1","observation.images.wrist":"observation.images.camera2"}' \
+  --batch_size=16 \
+  --steps=6000 \
+  --output_dir=outputs/train/smolvla_calvin_pick_push \
+  --save_checkpoint=true \
+  --save_freq=500 \
+  --policy.device=cuda \
+  --wandb.enable=true \
+  --policy.repo_id=redha24/smolvla_calvin_pick_push
+```
+Evaluation
+```bash
+cd ../lerobot-calvin/dataset
+sh download_data.sh D
+tar -xzvf task_D_D.tar.gz
+cd ..
+python calvin_models/calvin_agent/evaluation/evaluate_policy.py \
+   --dataset_path /dataset/task_D_D \
+   --custom_model \
+   --checkpoint PATH_TO_FOLDER_CHECKPOINTS/00500 \ #exemple 00500 steps
+   --device 0
+```
+
 # CALVIN
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![Language grade: Python](https://img.shields.io/lgtm/grade/python/g/mees/calvin.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/mees/calvin/context:python)
