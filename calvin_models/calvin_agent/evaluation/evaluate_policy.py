@@ -49,6 +49,16 @@ from lerobot.processor.pipeline import PolicyProcessorPipeline
 from lerobot.configs.types import PolicyFeature, FeatureType
 import json
 from safetensors.torch import load_file
+#not annotations, just tasks names
+TASK_SET = {
+    "push_pink_block_left",
+    "push_pink_block_right",
+    "push_blue_block_left",
+    "push_blue_block_right",
+    "lift_blue_block_table",
+    "lift_pink_block_table",
+}
+
 
 
 logger = logging.getLogger(__name__)
@@ -92,7 +102,7 @@ def normalize_features(features: dict | None):
 class CustomModel(CalvinBaseModel):
     def __init__(self, checkpoint_dir, device="cpu"):
         checkpoint_dir = Path(checkpoint_dir)
-        model_dir = checkpoint_dir / "pretrained_model"
+        model_dir = checkpoint_dir    #/ "pretrained_model"
 
         self.device = torch.device(device)
 
@@ -212,17 +222,43 @@ def evaluate_policy(model, env, epoch, eval_log_dir=None, debug=False, create_pl
 
     eval_log_dir = get_log_dir(eval_log_dir)
 
-    eval_sequences = get_sequences(NUM_SEQUENCES)
+    ALL_SEQS = get_sequences(NUM_SEQUENCES)
+
+    eval_sequences = []
+    for init, seq in ALL_SEQS:
+        # keep only sequences where the first task is one trained on
+        if seq[0] in TASK_SET:
+            eval_sequences.append((init, [seq[0]]))
+
+    # cap to a small number
+    #eval_sequences = eval_sequences[:20]
+    from collections import Counter
+    print(Counter(seq[0] for _, seq in eval_sequences))
+
+
 
     results = []
     plans = defaultdict(list)
+    per_task_results = defaultdict(list)
+
 
     if not debug:
         eval_sequences = tqdm(eval_sequences, position=0, leave=True)
 
     for initial_state, eval_sequence in eval_sequences:
-        result = evaluate_sequence(env, model, task_oracle, initial_state, eval_sequence, val_annotations, plans, debug)
+        task_name = eval_sequence[0]
+
+        result = evaluate_sequence(
+            env, model, task_oracle, initial_state, eval_sequence,
+            val_annotations, plans, debug
+        )
+
         results.append(result)
+
+        # success = 1 if solved, 0 if failed
+        success = 1 if result >= 1 else 0
+        per_task_results[task_name].append(success)
+
         if not debug:
             eval_sequences.set_description(
                 " ".join([f"{i + 1}/5 : {v * 100:.1f}% |" for i, v in enumerate(count_success(results))]) + "|"
@@ -230,6 +266,21 @@ def evaluate_policy(model, env, epoch, eval_log_dir=None, debug=False, create_pl
 
     if create_plan_tsne:
         create_tsne(plans, eval_log_dir, epoch)
+
+    print("\n===== PER-TASK SUCCESS RATES =====")
+    for task, successes in per_task_results.items():
+        rate = 100 * np.mean(successes) if len(successes) > 0 else 0.0
+        print(f"{task:30s} : {rate:5.1f}%  ({len(successes)} episodes)")
+    print("=================================\n")
+
+    # Save per-task results
+    with open(Path(eval_log_dir) / "per_task_results.json", "w") as f:
+        json.dump(
+            {k: float(np.mean(v)) for k, v in per_task_results.items()},
+            f,
+            indent=2
+        )
+
     print_and_save(results, eval_sequences, eval_log_dir, epoch)
 
     return results
