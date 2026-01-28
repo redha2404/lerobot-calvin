@@ -127,8 +127,8 @@ class CustomModel(CalvinBaseModel):
         with open(model_dir / "config.json", "r") as f:
             cfg_dict = json.load(f)
 
-        cfg_dict = dict(cfg_dict)          # sécurité
-        cfg_dict.pop("type", None)         # ← LIGNE CRUCIALE
+        cfg_dict = dict(cfg_dict)
+        cfg_dict.pop("type", None)
         config = SmolVLAConfig(**cfg_dict)
         config.input_features = normalize_features(config.input_features)
         config.output_features = normalize_features(config.output_features)
