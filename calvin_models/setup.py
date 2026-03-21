@@ -22,9 +22,7 @@ def find_meta(_meta, string):
     raise RuntimeError(f"Unable to find {string} string.")
 
 
-install_requires = [
-    l for l in _read("requirements.txt").split("\n") if l and not l.startswith("#") and not l.startswith("-")
-]
+install_requires = []
 
 meta = dict(
     name=find_meta(_meta, "__project__"),

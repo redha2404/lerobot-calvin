@@ -1,175 +1,117 @@
+import argparse
 import logging
 from pathlib import Path
 
-from calvin_agent.evaluation.utils import imshow_tensor
-from calvin_agent.models.mcil import MCIL
-from calvin_agent.utils.utils import get_last_checkpoint
 import cv2
-import hydra
 import numpy as np
-from omegaconf import DictConfig, OmegaConf
-from omegaconf.errors import MissingMandatoryValue
-from pytorch_lightning import seed_everything
 import torch
+from pytorch_lightning import seed_everything
+import sys
+
+# Assume this script runs within the main calvin repo directory
+sys.path.insert(0, str(Path(__file__).absolute().parents[2]))
+
+# Assuming calvin_agent/evaluation/evaluate_policy.py's CustomModel
+# We will construct an absolute import path for CustomModel
+from calvin_models.calvin_agent.evaluation.evaluate_policy import CustomModel, make_env
 
 logger = logging.getLogger(__name__)
 
-
-def get_checkpoint(cfg):
-    try:
-        checkpoint = cfg.load_checkpoint
-    except MissingMandatoryValue:
-        checkpoint = get_last_checkpoint(Path(cfg.train_folder))
-    return checkpoint
-
-
-def format_sftp_path(cfg):
+def imshow_tensor(window, img_tensor, wait=0, resize=True, keyhandler=None):
     """
-    When using network mount from nautilus, format path
+    Shows a tensor image via OpenCV
     """
-    if cfg.train_folder.startswith("sftp"):
-        cfg.train_folder = "/run/user/9984/gvfs/sftp:host=" + cfg.train_folder[7:]
+    img = img_tensor.squeeze().cpu().numpy().transpose(1, 2, 0)
+    # BGR format for CV2
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    if resize:
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window, 600, 600)
+    cv2.imshow(window, img)
+    if keyhandler is not None:
+        return cv2.waitKey(wait)
+    else:
+        cv2.waitKey(wait)
 
 
-@hydra.main(config_path="../../conf/inference", config_name="config_inference")
-def test_policy(input_cfg: DictConfig) -> None:
-    """
-    Run inference on trained policy.
-     Arguments:
-        train_folder (str): path of trained model.
-        load_checkpoint (str): optional model checkpoint. If not specified, the last checkpoint is taken by default.
-        +datamodule.root_data_dir (str): /path/dataset when running inference on another machine than were it was trained
-        visualize (bool): wether to visualize the policy rollouts (default True).
-    """
-    # when mounting remote folder with sftp, format path
-    format_sftp_path(input_cfg)
-    # load config used during training
-    train_cfg_path = Path(input_cfg.train_folder) / ".hydra/config.yaml"
-    train_cfg = OmegaConf.load(train_cfg_path)
+def interactive_rollout(model, env, initial_lang_goal, max_steps=500):
+    print("\n" + "="*50)
+    print("🤖 INTERACTIVE LEROBOT ROLLOUT")
+    print(f"Goal: '{initial_lang_goal}'")
+    print("="*50)
+    print("Controls (Make sure OpenCV window is focused):")
+    print(" [t] : Pause and Type a new text instruction")
+    print(" [n] : End current rollout")
+    print("="*50)
 
-    # merge configs to keep current cmd line overrides
-    cfg = OmegaConf.merge(train_cfg, input_cfg)
-    seed_everything(cfg.seed)
+    obs = env.reset()
+    lang_goal = initial_lang_goal
+    
+    cv2.namedWindow("LeRobot Calvin Agent", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("LeRobot Calvin Agent", 600, 600)
 
-    # since we don't use the trainer during inference, manually set up data_module
-    data_module = hydra.utils.instantiate(cfg.datamodule, num_workers=4)
-    data_module.prepare_data()
-    data_module.setup()
-    dataloader = data_module.val_dataloader()
-    dataset = dataloader.dataset.datasets["vis"]
-    env = hydra.utils.instantiate(cfg.callbacks.rollout.env_cfg, dataset, torch.device("cuda:0"), show_gui=False)
+    for step in range(max_steps):
+        # 1. Get Action from LeRobot CustomModel wrapper
+        # The wrapper expects obs["rgb_obs"] exactly as given by CALVIN env
+        action_tuple = model.step(obs, lang_goal)
+        
+        # LeRobot wrapper returns (relative_pos, relative_euler, gripper_action)
+        action_array = np.concatenate([action_tuple[0], action_tuple[1], [action_tuple[2]]])
+        
+        # 2. Step physics
+        obs, _, _, current_info = env.step(action_array)
 
-    tasks = hydra.utils.instantiate(cfg.callbacks.rollout.tasks)
-    checkpoint = get_checkpoint(cfg)
-    logger.info("Loading model from checkpoint.")
-    model = MCIL.load_from_checkpoint(checkpoint)
-    model.freeze()
-    # model.action_decoder._setup_action_bounds(cfg.datamodule.root_data_dir, None, None)
-    model = model.cuda(0)
-    logger.info("Successfully loaded model.")
+        # 3. Visualize & Handle Input
+        img = env.render(mode="rgb_array")
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        
+        # Overlay current instruction text
+        cv2.putText(img_bgr, f"Goal: {lang_goal}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        cv2.imshow("LeRobot Calvin Agent", img_bgr)
+        k = cv2.waitKey(1) % 256
 
-    ep_start_end_ids = np.sort(np.load(dataset.abs_datasets_dir / "ep_start_end_ids.npy"), axis=0)
+        if k == ord('t'):
+            print("\n[PAUSED] Enter new command:")
+            # Wait for user input in terminal
+            new_goal = input("> ")
+            if new_goal.strip():
+                lang_goal = new_goal.strip()
+                print(f"Goal updated to: '{lang_goal}'")
+                
+        elif k == ord('n') or k == 27: # 'n' or ESC
+            print("\n[STOPPING ROLLOUT]")
+            break
 
-    for s, e in ep_start_end_ids:
-        i = start_i = s
-        file = dataset.abs_datasets_dir / f"episode_{i:06d}.npz"
-        data = np.load(file)
-        obs = env.reset(scene_obs=data["scene_obs"], robot_obs=data["robot_obs"])
-        start_info = env.get_info()
-        current_img_obs = start_img_obs = obs["rgb_obs"]
-        start_state_obs = obs["state_obs"]
-        goal_imgs = obs["rgb_obs"]
-        goal_state = obs["state_obs"]
-        scene_obs = data["scene_obs"]
-        robot_obs = data["robot_obs"]
-        while 1:
-            imshow_tensor("current_img", current_img_obs[0], wait=1)
-            imshow_tensor("start", start_img_obs[0], wait=1)
-            imshow_tensor("goal", goal_imgs[0], wait=1)
-            cv2.imshow("keylistener", np.zeros((300, 300)))
-            k = cv2.waitKey(0) % 256
-            if k == ord("s"):
-                start_info = env.get_info()
-                start_img_obs = obs["rgb_obs"]
-                start_state_obs = obs["state_obs"]
-                scene_obs = data["scene_obs"]
-                robot_obs = data["robot_obs"]
-                start_i = i
-            elif k == ord("w"):
-                end_info = env.get_info()
-                print(tasks.get_task_info(start_info, end_info))
-                goal_imgs = obs["rgb_obs"]
-                goal_state = obs["state_obs"]
-                print(f"steps: {i - start_i}")
-            elif k == ord("r"):
-                file = dataset.abs_datasets_dir / f"episode_{i:06d}.npz"
-                data = np.load(file)
-                obs = env.reset(scene_obs=data["scene_obs"])
-                current_img_obs = obs["rgb_obs"]
-            elif k == ord("a"):
-                i -= 1
-                i = np.clip(i, s, e)
-                file = dataset.abs_datasets_dir / f"episode_{i:06d}.npz"
-                data = np.load(file)
-                obs = env.reset(scene_obs=data["scene_obs"], robot_obs=data["robot_obs"])
-                current_img_obs = obs["rgb_obs"]
-
-            elif k == ord("d"):
-                i += 1
-                i = np.clip(i, s, e)
-                file = dataset.abs_datasets_dir / f"episode_{i:06d}.npz"
-                data = np.load(file)
-                obs = env.reset(scene_obs=data["scene_obs"], robot_obs=data["robot_obs"])
-                current_img_obs = obs["rgb_obs"]
-            elif k == ord("q"):
-                i -= 100
-                i = np.clip(i, s, e)
-                file = dataset.abs_datasets_dir / f"episode_{i:06d}.npz"
-                data = np.load(file)
-                obs = env.reset(scene_obs=data["scene_obs"], robot_obs=data["robot_obs"])
-                current_img_obs = obs["rgb_obs"]
-
-            elif k == ord("e"):
-                i += 100
-                i = np.clip(i, s, e)
-                file = dataset.abs_datasets_dir / f"episode_{i:06d}.npz"
-                data = np.load(file)
-                obs = env.reset(scene_obs=data["scene_obs"], robot_obs=data["robot_obs"])
-                current_img_obs = obs["rgb_obs"]
-
-            elif k == ord("f"):
-                env.reset(scene_obs=scene_obs, robot_obs=robot_obs)
-                rollout(model, env, tasks, cfg, start_info, start_img_obs, start_state_obs, goal_imgs, goal_state)
-                obs = env.reset(scene_obs=scene_obs, robot_obs=robot_obs)
-                current_img_obs = obs["rgb_obs"]
-                i = start_i
-            elif k == ord("n"):  # ESC
-                break
+    cv2.destroyAllWindows()
 
 
-def rollout(model, env, tasks, cfg, start_info, current_img_obs, current_state_obs, goal_imgs, goal_state):
-    # goal image is last step of the episode
-    # goal_imgs = [goal_img.unsqueeze(0).cuda() for goal_img in goal_imgs]
-    goal_imgs = goal_imgs[0].contiguous()
-    for step in range(cfg.ep_len):
-        #  replan every replan_freq steps (default 30 i.e every second)
-        if step % cfg.replan_freq == 0:
-            plan, latent_goal = model.get_pp_plan_vision(
-                current_img_obs, goal_imgs, current_state_obs, goal_state
-            )  # type: ignore
-        imshow_tensor("current_img", current_img_obs[0], wait=1)
+def main():
+    parser = argparse.ArgumentParser(description="Interactive Rollout for LeRobot policies.")
+    parser.add_argument("--dataset_path", type=str, required=True, help="Path to CALVIN dataset (e.g. task_D_D)")
+    parser.add_argument("--train_folder", type=str, required=True, help="Path to trained model directory")
+    parser.add_argument("--device", type=str, default="cuda", help="Execution device (cuda/cpu)")
+    args = parser.parse_args()
 
-        # use plan to predict actions with current observations
-        action = model.predict_with_plan(current_img_obs, current_state_obs, latent_goal, plan)
-        obs, _, _, current_info = env.step(action)
-        # check if current step solves a task
-        current_task_info = tasks.get_task_info(start_info, current_info)
-        if len(current_task_info) > 0:
-            print(current_task_info)
-        # update current observation
-        current_img_obs = obs["rgb_obs"]
-        current_state_obs = obs["state_obs"]
+    seed_everything(0, workers=True)
 
+    # Load Model (CustomModel wrapper we created for SmolVLA)
+    print(f"Loading model from {args.train_folder}...")
+    model = CustomModel(checkpoint_dir=args.train_folder, device=args.device)
+
+    # Make Environment
+    print(f"Loading environment from {args.dataset_path}...")
+    env = make_env(args.dataset_path)
+
+    while True:
+        lang_goal = input("\nEnter initial instruction (or 'q' to quit): ")
+        if lang_goal.lower() == 'q':
+            break
+            
+        model.reset()
+        interactive_rollout(model, env, lang_goal)
+
+    print("Exiting...")
 
 if __name__ == "__main__":
-    test_policy()
+    main()

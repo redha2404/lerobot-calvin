@@ -5,6 +5,17 @@ import os
 from pathlib import Path
 import sys
 import time
+import cv2  # Used for local video rendering and logging
+
+# Path to the LeRobot *repo root* (the one that contains lerobot/)
+LEROBOT_REPO_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "../../../../lerobot/src")
+)
+
+print("Adding LeRobot repo root to PYTHONPATH:", LEROBOT_REPO_ROOT)
+
+if LEROBOT_REPO_ROOT not in sys.path:
+    sys.path.insert(0, LEROBOT_REPO_ROOT)
 
 # This is for using the locally installed repo clone when using slurm
 from calvin_agent.models.calvin_base_model import CalvinBaseModel
@@ -33,12 +44,17 @@ from tqdm.auto import tqdm
 
 from calvin_env.envs.play_table_env import get_env
 
+from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.processor.pipeline import PolicyProcessorPipeline
+from lerobot.configs.types import PolicyFeature, FeatureType
+import json
+from safetensors.torch import load_file
+# --- EVALUATION MATRIX ---
+# Passed directly via CLI or defaults in evaluate_policy()
 logger = logging.getLogger(__name__)
 
-EP_LEN = 360
-NUM_SEQUENCES = 1000
-
-
+# Constants previously hardcoded here (EP_LEN, NUM_SEQUENCES) are now passed explicitly via CLI and main().
 def get_epoch(checkpoint):
     if "=" not in checkpoint.stem:
         return "0"
@@ -47,50 +63,140 @@ def get_epoch(checkpoint):
 
 def make_env(dataset_path):
     val_folder = Path(dataset_path) / "validation"
-    env = get_env(val_folder, show_gui=False)
+    env = get_env(val_folder, show_gui=True)
 
     # insert your own env wrapper
     # env = Wrapper(env)
     return env
 
+def normalize_features(features: dict | None):
+    if features is None:
+        return None
+
+    out = {}
+    for name, ft in features.items():
+        if isinstance(ft, PolicyFeature):
+            out[name] = ft
+        elif isinstance(ft, dict):
+            out[name] = PolicyFeature(
+                type=FeatureType(ft["type"]),
+                shape=tuple(ft.get("shape", ())),
+            )
+        else:
+            raise TypeError(f"Unsupported feature type for {name}: {type(ft)}")
+    return out
+
 
 class CustomModel(CalvinBaseModel):
-    def __init__(self):
-        logger.warning("Please implement these methods as an interface to your custom model architecture.")
-        raise NotImplementedError
+    def __init__(self, checkpoint_dir, device="cpu"):
+        checkpoint_dir = Path(checkpoint_dir)
+        self.device = torch.device(device)
+
+        # -------------------------
+        # 1. Load preprocessors
+        # -------------------------
+        self.preprocessor = PolicyProcessorPipeline.from_pretrained(
+            pretrained_model_name_or_path=str(checkpoint_dir / "preprocessor"),
+            config_filename="policy_preprocessor.json",
+            overrides={"device_processor": {"device": "cpu"}},
+        )
+
+        self.postprocessor = PolicyProcessorPipeline.from_pretrained(
+            pretrained_model_name_or_path=str(checkpoint_dir / "postprocessor"),
+            config_filename="policy_postprocessor.json",
+            overrides={"device_processor": {"device": "cpu"}},
+        )
+
+        # -------------------------
+        # 2. Load and clean config
+        # -------------------------
+        with open(checkpoint_dir / "config.json", "r") as f:
+            cfg_dict = json.load(f)
+
+        import inspect
+        valid_args = inspect.signature(SmolVLAConfig.__init__).parameters.keys()
+        cleaned_cfg_dict = {k: v for k, v in cfg_dict.items() if k in valid_args}
+
+        config = SmolVLAConfig(**cleaned_cfg_dict)
+        config.input_features = normalize_features(config.input_features)
+        config.output_features = normalize_features(config.output_features)
+
+        # -------------------------
+        # 3. Instantiate policy and load weights
+        # -------------------------
+        self.policy = SmolVLAPolicy(config)
+        self.policy.to(self.device)
+
+        state_dict = load_file(
+            str(checkpoint_dir / "model.safetensors"),
+            device=str(self.device),
+        )
+        self.policy.load_state_dict(state_dict, strict=False)
+
+        self.policy.eval()
+        self.reset()
 
     def reset(self):
-        """
-        This is called
-        """
-        raise NotImplementedError
+        self.policy.reset()
 
+    @torch.no_grad()
     def step(self, obs, goal):
-        """
-        Args:
-            obs: environment observations
-            goal: embedded language goal
-        Returns:
-            action: predicted action
-        """
-        raise NotImplementedError
+        # Image scaling: LeRobot expects [0, 1] for VLMs
+        img_front = torch.from_numpy(obs["rgb_obs"]["rgb_static"]).permute(2, 0, 1).float() / 255.0
+        img_wrist = torch.from_numpy(obs["rgb_obs"]["rgb_gripper"]).permute(2, 0, 1).float() / 255.0
+
+        batch = {
+            "observation.images.front": img_front,
+            "observation.images.wrist": img_wrist,
+            "observation.state": torch.from_numpy(obs["robot_obs"]).float(),
+            "task": goal,
+        }
+
+        model_dtype = next(self.policy.parameters()).dtype
+
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                batch[k] = v.unsqueeze(0).to(self.device, dtype=model_dtype)
+            else:
+                batch[k] = v
+
+        batch = self.preprocessor(batch)
+        
+        # The model's state_proj might only expect 6-dim (pos + euler)
+        # Slicing after normalization to ensure dimension match
+        if batch["observation.state"].shape[-1] > 6:
+            batch["observation.state"] = batch["observation.state"][:, :6]
+
+        # Query policy for action
+        action = self.policy.select_action(batch)
+        
+        # Post-process model output back into robot action space
+        action = self.postprocessor({"action": action})["action"]
+        action = action.squeeze(0).cpu().numpy()
+        
+        # SmolVLA models operating in Action Chunking mode (n_action_steps > 1) output a sequence of actions. 
+        # For strict reactive evaluation in simulators like PyBullet, we select only the very first action (t=0) and discard the rest. 
+        # To generalize to other environments, adapt the slice index based on your action execution frequency.
+        if action.ndim == 2:
+            action = action[0]
+
+        return (action[:3], action[3:6], 1 if action[6] > 0 else -1)
 
 
-def evaluate_policy(model, env, epoch, eval_log_dir=None, debug=False, create_plan_tsne=False):
+
+def evaluate_policy(model, env, epoch, eval_log_dir=None, debug=False, create_plan_tsne=False, record_obj=None, eval_matrix=None, ep_len=90, num_sequences=5000):
     """
     Run this function to evaluate a model on the CALVIN challenge.
-
-    Args:
-        model: Must implement methods of CalvinBaseModel.
-        env: (Wrapped) calvin env.
-        epoch:
-        eval_log_dir: Path where to log evaluation results. If None, logs to /tmp/evaluation/
-        debug: If True, show camera view and debug info.
-        create_plan_tsne: Collect data for TSNE plots of latent plans (does not work for your custom model)
-
-    Returns:
-        Dictionary with results
+    record_obj is a dict containing {"video_dir": path, "max_videos": int, "num_recorded": 0}
     """
+    if eval_matrix is None:
+        eval_matrix = {
+            ("lift_pink_block_table", "stack_block"): 5, 
+            ("lift_blue_block_table", "stack_block"): 5, 
+            ("lift_pink_block_table", "*"): 5,
+            ("lift_blue_block_table", "*"): 5,
+        }
+
     conf_dir = Path(__file__).absolute().parents[2] / "conf"
     task_cfg = OmegaConf.load(conf_dir / "callbacks/rollout/tasks/new_playtable_tasks.yaml")
     task_oracle = hydra.utils.instantiate(task_cfg)
@@ -98,17 +204,66 @@ def evaluate_policy(model, env, epoch, eval_log_dir=None, debug=False, create_pl
 
     eval_log_dir = get_log_dir(eval_log_dir)
 
-    eval_sequences = get_sequences(NUM_SEQUENCES)
+    ALL_SEQS = get_sequences(num_sequences)
+    
+    eval_sequences = []
+    counts = {k: 0 for k in eval_matrix.keys()}
+    
+    for init, seq in ALL_SEQS:
+        if len(seq) >= 2:
+            # Attempt exact pair match or fallback to wildcard
+            current_pair = (seq[0], seq[1])
+            wildcard_pair = (seq[0], "*")
+            
+            # Priority 1: Exact match
+            matched_key = None
+            if current_pair in eval_matrix and counts[current_pair] < eval_matrix[current_pair]:
+                matched_key = current_pair
+            # Priority 2: Wildcard match (e.g., if any second task satisfies the matrix requirement)
+            elif wildcard_pair in eval_matrix and counts[wildcard_pair] < eval_matrix[wildcard_pair] and current_pair not in eval_matrix:
+                matched_key = wildcard_pair
+                
+            if matched_key is not None:
+                # Cache sequence and the matched tracking key for JSON reporting
+                eval_sequences.append((init, [seq[0], seq[1]], matched_key))
+                counts[matched_key] += 1
+                
+        # Terminate search when evaluation matrix quotas are fulfilled
+        if all(counts[k] >= eval_matrix[k] for k in eval_matrix):
+            break
+
+    print("\n===== EVALUATION MATRIX SEQUENCES =====")
+    for pair, count in counts.items():
+        print(f" - {pair[0]} -> {pair[1]:15s} : {count} / {eval_matrix[pair]}")
+    print("==============================\n")
 
     results = []
     plans = defaultdict(list)
+    per_task_results = defaultdict(list)
+    
+    # Track results per specific task pair to output detailed structured JSON metrics
+    matrix_results = defaultdict(list)
 
     if not debug:
         eval_sequences = tqdm(eval_sequences, position=0, leave=True)
 
-    for initial_state, eval_sequence in eval_sequences:
-        result = evaluate_sequence(env, model, task_oracle, initial_state, eval_sequence, val_annotations, plans, debug)
+    for i, (initial_state, eval_sequence, matched_key) in enumerate(eval_sequences):
+        task_name = eval_sequence[0]
+        # We use matched_key (e.g., ("lift_pink_block_table", "*")) instead of the exact pair
+        pair_key = matched_key
+
+        result = evaluate_sequence(
+            env, model, task_oracle, initial_state, eval_sequence,
+            val_annotations, plans, debug, record_obj, env_id=i, ep_len=ep_len
+        )
+
         results.append(result)
+        matrix_results[pair_key].append(result)
+
+        # success = 1 if solved, 0 if failed
+        success = 1 if result >= 1 else 0
+        per_task_results[task_name].append(success)
+
         if not debug:
             eval_sequences.set_description(
                 " ".join([f"{i + 1}/5 : {v * 100:.1f}% |" for i, v in enumerate(count_success(results))]) + "|"
@@ -116,16 +271,39 @@ def evaluate_policy(model, env, epoch, eval_log_dir=None, debug=False, create_pl
 
     if create_plan_tsne:
         create_tsne(plans, eval_log_dir, epoch)
-    print_and_save(results, eval_sequences, eval_log_dir, epoch)
+
+    print("\n===== PER-TASK SUCCESS RATES =====")
+    for task, successes in per_task_results.items():
+        rate = 100 * np.mean(successes) if len(successes) > 0 else 0.0
+        print(f"{task:30s} : {rate:5.1f}%  ({len(successes)} episodes)")
+    print("=================================\n")
+
+    # Calculate statistics and save structured JSON readout
+    final_json_data = {}
+    for pair, res_list in matrix_results.items():
+        n_total = len(res_list)
+        sr_task1 = sum(1 for r in res_list if r >= 1) / n_total if n_total > 0 else 0.0
+        sr_task2 = sum(1 for r in res_list if r >= 2) / n_total if n_total > 0 else 0.0
+        
+        # JSON requires string keys: format as "task1, task2"
+        key_str = f"{pair[0]}, {pair[1]}"
+        final_json_data[key_str] = [n_total, sr_task1, sr_task2]
+
+    # Save results
+    with open(Path(eval_log_dir) / "per_task_results.json", "w") as f:
+        json.dump(final_json_data, f, indent=2)
+
+    legacy_eval_sequences = [(init, seq) for init, seq, _ in eval_sequences]
+    print_and_save(results, legacy_eval_sequences, eval_log_dir, epoch)
 
     return results
 
 
-def evaluate_sequence(env, model, task_checker, initial_state, eval_sequence, val_annotations, plans, debug):
+def evaluate_sequence(env, model, task_checker, initial_state, eval_sequence, val_annotations, plans, debug, record_obj=None, env_id=0, ep_len=90):
     """
     Evaluates a sequence of language instructions.
     """
-    robot_obs, scene_obs = get_env_state_for_initial_condition(initial_state)
+    robot_obs, scene_obs = get_env_state_for_initial_condition(initial_state, env_id)
     env.reset(robot_obs=robot_obs, scene_obs=scene_obs)
 
     success_counter = 0
@@ -135,8 +313,9 @@ def evaluate_sequence(env, model, task_checker, initial_state, eval_sequence, va
         print()
         print(f"Evaluating sequence: {' -> '.join(eval_sequence)}")
         print("Subtask: ", end="")
+        
     for subtask in eval_sequence:
-        success = rollout(env, model, task_checker, subtask, val_annotations, plans, debug)
+        success = rollout(env, model, task_checker, subtask, val_annotations, plans, debug, record_obj, ep_len=ep_len)
         if success:
             success_counter += 1
         else:
@@ -144,7 +323,7 @@ def evaluate_sequence(env, model, task_checker, initial_state, eval_sequence, va
     return success_counter
 
 
-def rollout(env, model, task_oracle, subtask, val_annotations, plans, debug):
+def rollout(env, model, task_oracle, subtask, val_annotations, plans, debug, record_obj=None, ep_len=90):
     """
     Run the actual rollout on one subtask (which is one natural language instruction).
     """
@@ -157,13 +336,34 @@ def rollout(env, model, task_oracle, subtask, val_annotations, plans, debug):
     model.reset()
     start_info = env.get_info()
 
-    for step in range(EP_LEN):
+    # --- VIDEO RECORDING SETUP ---
+    video_writer = None
+    if record_obj is not None and record_obj["num_recorded"] < record_obj["max_videos"]:
+        video_dir = Path(record_obj["video_dir"])
+        video_dir.mkdir(parents=True, exist_ok=True)
+        video_filename = video_dir / f"eval_{record_obj['num_recorded']:03d}_{subtask.replace(' ', '_')}.mp4"
+        
+        # Render a throwaway frame strictly to acquire dynamic HxWxC dimensions for cv2.VideoWriter. 
+        # This natively generalizes video recording to any environment resolution.
+        img_np = env.render(mode="rgb_array")
+        h, w, c = img_np.shape
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v') # type: ignore
+        video_writer = cv2.VideoWriter(str(video_filename), fourcc, 30.0, (w, h))
+
+    for step in range(ep_len):
         action = model.step(obs, lang_annotation)
         obs, _, _, current_info = env.step(action)
-        if debug:
+        
+        # Render visualization and append to video stream if recording is enabled
+        if debug or video_writer is not None:
             img = env.render(mode="rgb_array")
             join_vis_lang(img, lang_annotation)
-            # time.sleep(0.1)
+            
+            # cv2 expects BGR format cleanly converted from RGB
+            if video_writer is not None:
+                img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                video_writer.write(img_bgr)
+                
         if step == 0:
             # for tsne plot, only if available
             collect_plan(model, plans, subtask)
@@ -173,9 +373,16 @@ def rollout(env, model, task_oracle, subtask, val_annotations, plans, debug):
         if len(current_task_info) > 0:
             if debug:
                 print(colored("success", "green"), end=" ")
+            if video_writer is not None:
+                video_writer.release()
+                record_obj["num_recorded"] += 1
             return True
+
     if debug:
         print(colored("fail", "red"), end=" ")
+    if video_writer is not None:
+        video_writer.release()
+        record_obj["num_recorded"] += 1
     return False
 
 
@@ -214,15 +421,53 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Print debug info and visualize environment.")
 
     parser.add_argument("--eval_log_dir", default=None, type=str, help="Where to log the evaluation results.")
-
     parser.add_argument("--device", default=0, type=int, help="CUDA device")
+
+    # --- NOUVEAU: Vidéo ---
+    parser.add_argument("--record_video_dir", type=str, default=None, help="Directory to save evaluation videos.")
+    parser.add_argument("--record_max_videos", type=int, default=10, help="Maximum number of videos to record.")
+    
+    # --- EVAL MATRIX ---
+    parser.add_argument("--eval_matrix", type=str, default=None, help="JSON array of task tuples and counts, e.g. '[[\"lift_pink_block_table\", \"stack_block\", 5]]'")
+    parser.add_argument("--ep_len", type=int, default=90, help="Length of the evaluation episode horizon")
+    parser.add_argument("--num_sequences", type=int, default=5000, help="Size of the raw sequence pool to query exact pairs")
+    
     args = parser.parse_args()
+    
+    eval_matrix = None
+    if args.eval_matrix:
+        matrix_list = json.loads(args.eval_matrix)
+        eval_matrix = {}
+        for item in matrix_list:
+            eval_matrix[(item[0], item[1])] = int(item[2])
+    
+    record_obj = None
+    if args.record_video_dir:
+        record_obj = {
+            "video_dir": args.record_video_dir,
+            "max_videos": args.record_max_videos,
+            "num_recorded": 0
+        }
 
     # evaluate a custom model
     if args.custom_model:
-        model = CustomModel()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = CustomModel(
+            checkpoint_dir=args.checkpoint,
+            device=device,
+        )
         env = make_env(args.dataset_path)
-        evaluate_policy(model, env, debug=args.debug)
+        evaluate_policy(
+            model,
+            env,
+            epoch="custom",
+            eval_log_dir=args.eval_log_dir,
+            debug=args.debug,
+            record_obj=record_obj,
+            eval_matrix=eval_matrix,
+            ep_len=args.ep_len,
+            num_sequences=args.num_sequences
+        )
     else:
         assert "train_folder" in args
 
@@ -249,7 +494,7 @@ def main():
                 env=env,
                 device_id=args.device,
             )
-            evaluate_policy(model, env, epoch, eval_log_dir=args.eval_log_dir, debug=args.debug, create_plan_tsne=True)
+            evaluate_policy(model, env, epoch, eval_log_dir=args.eval_log_dir, debug=args.debug, create_plan_tsne=True, eval_matrix=eval_matrix, ep_len=args.ep_len, num_sequences=args.num_sequences)
 
 
 if __name__ == "__main__":
